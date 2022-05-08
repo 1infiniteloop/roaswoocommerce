@@ -6,12 +6,8 @@ const { concatMap, map: rxmap, filter: rxfilter, tap, reduce: rxreduce, defaultI
 const { query, where, getDocs, collection } = require("firebase/firestore");
 const { db } = require("./database");
 const { logroupby, lokeyby, pipeLog, louniqby, lomap, isEmail, isIPv4, isIPv6, lohas, loreduce, lofilter, losortby, loorderby } = require("helpers");
-
 const { get, all, mod, into, matching } = require("shades");
-
 const { Facebook: RoasFacebook } = require("roasfacebook");
-
-const loorderby = curry((path, direction, data) => lodashorderby(data, path, direction));
 
 const Timestamp = {};
 
