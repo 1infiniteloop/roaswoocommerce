@@ -1,13 +1,18 @@
 const moment = require("moment-timezone");
-const { pick, map, pipe, values, head, identity, of, keys, curry, not, sum, flatten } = require("ramda");
-const { size, isUndefined, isEmpty, toNumber, orderBy: lodashorderby } = require("lodash");
+const { pick, map, pipe, values, head, identity, of, keys, curry, not, sum, flatten, paths, uniq, reject, mergeAll } = require("ramda");
+const { size, isUndefined, isEmpty, toNumber, orderBy: lodashorderby, compact, toLower } = require("lodash");
 const { from, zip, Observable, of: rxof, iif, catchError, throwError } = require("rxjs");
 const { concatMap, map: rxmap, filter: rxfilter, tap, reduce: rxreduce, defaultIfEmpty } = require("rxjs/operators");
-const { query, where, getDocs, collection } = require("firebase/firestore");
+const { query, where, getDocs, collection, limit, collectionGroup } = require("firebase/firestore");
 const { db } = require("./database");
 const { logroupby, lokeyby, pipeLog, louniqby, lomap, isEmail, isIPv4, isIPv6, lohas, loreduce, lofilter, losortby, loorderby } = require("helpers");
 const { get, all, mod, into, matching } = require("shades");
 const { Facebook: RoasFacebook } = require("roasfacebook");
+
+const ipEvents = curry((version, ip, roas_user_id) => {
+    let q = query(collection(db, "events"), where(version, "==", ip), where("roas_user_id", "==", roas_user_id));
+    return from(getDocs(q)).pipe(rxmap(Woocommerce.utilities.queryDocs));
+});
 
 const Timestamp = {};
 
@@ -27,7 +32,7 @@ Timestamp.toUTCDigit = (timestamp) => {
 const Facebook = {
     ads: {
         details: {
-            get: ({ ad_ids, user_id, fb_ad_account_id, date } = {}) => {
+            get: ({ ad_ids = [], user_id, fb_ad_account_id, date } = {}) => {
                 let func_name = `Facebook:ads:details`;
                 console.log(func_name);
 
@@ -45,7 +50,8 @@ const Facebook = {
                             rxmap((ad) => ({ ...ad, timestamp })),
                             rxfilter(pipe(isEmpty, not))
                         );
-                    })
+                    }),
+                    defaultIfEmpty([])
                 );
             },
         },
@@ -308,6 +314,10 @@ const Woocommerce = {
             start: moment(Woocommerce.utilities.date_pacific_time(start, timezone)).add(1, "days").startOf("day").valueOf(),
             end: moment(Woocommerce.utilities.date_pacific_time(end, timezone)).add(1, "days").endOf("day").valueOf(),
         }),
+
+        queryDocs: (snapshot) => snapshot.docs.map((doc) => doc.data()),
+
+        rxreducer: rxreduce((prev, curr) => [...prev, ...curr]),
     },
 
     orders: {
@@ -362,6 +372,7 @@ const Woocommerce = {
                             first_name: billing.first_name,
                             last_name: billing.last_name,
                             email: billing.email,
+                            lower_case_email: toLower(billing.email),
                         }))
                     )
                 ),
@@ -415,6 +426,7 @@ const Woocommerce = {
 
                 return pipe(
                     get("line_items"),
+                    louniqby("id"),
                     mod(all)(({ price, name, total_tax }) => ({ price: Number(price) + Number(total_tax), name }))
                 )(order);
             },
@@ -450,6 +462,7 @@ const Woocommerce = {
                 first_name,
                 last_name,
                 email,
+                lower_case_email: toLower(email),
             };
         },
     },
@@ -459,7 +472,7 @@ const Woocommerce = {
             let func_name = `Woocommerce:report:get`;
             console.log(func_name);
 
-            return Woocommerce.orders.get({ user_id, date }).pipe(
+            let orders = Woocommerce.orders.get({ user_id, date }).pipe(
                 rxmap(logroupby("customer_ip_address")),
                 rxmap(mod(all)(Woocommerce.customer.normalize)),
                 rxmap(values),
@@ -469,36 +482,119 @@ const Woocommerce = {
                     cart: Woocommerce.order.cart.items(order),
                     stats: Woocommerce.order.stats.get(order),
                 })),
-                concatMap((order) =>
-                    Woocommerce.order.ads.get(order).pipe(
-                        rxfilter(pipe(isEmpty, not)),
-                        rxmap((ads) => ({ ...order, ads }))
-                    )
-                ),
-                concatMap((order) => {
-                    let { ads: ad_ids, email } = order;
+                rxmap(of),
+                Woocommerce.utilities.rxreducer,
+                rxmap(values)
+            );
 
-                    let ads = Facebook.ads.details.get({ ad_ids, fb_ad_account_id, user_id, date }).pipe(
+            // return orders;
+
+            let customers_from_db_events = from(orders).pipe(
+                concatMap(identity),
+                concatMap((customer) => {
+                    let { customer_ip_address: ip_address, roas_user_id } = customer;
+
+                    // return rxof(customer);
+
+                    return zip([from(ipEvents("ipv4", ip_address, roas_user_id)), from(ipEvents("ipv6", ip_address, roas_user_id))]).pipe(
+                        rxmap(flatten),
+                        concatMap(identity),
+                        rxmap((event) => ({
+                            ad_id: pipe(
+                                paths([["fb_ad_id"], ["h_ad_id"], ["fb_id"], ["ad_id"]]),
+                                compact,
+                                uniq,
+                                reject((id) => id == "%7B%7Bad.id%7D%7D"),
+                                head
+                            )(event),
+                            timestamp: pipe(Event.get_utc_timestamp)(event),
+                            ip: ip_address,
+                        })),
+                        rxmap(of),
+                        Woocommerce.utilities.rxreducer,
+                        rxmap(loorderby(["timesamp"], ["desc"])),
+                        rxmap(get(matching({ ad_id: (id) => !isEmpty(id) }))),
+                        rxmap(louniqby("ad_id")),
+                        rxmap(louniqby("timestamp")),
+                        rxmap((ads) => ({ ...customer, ads })),
+                        rxmap(of)
+                    );
+                }),
+                Woocommerce.utilities.rxreducer
+                // rxmap(pipeLog)
+                // concatMap((order) =>
+                //     Woocommerce.order.ads.get(order).pipe(
+                //         rxfilter(pipe(isEmpty, not)),
+                //         rxmap((ads) => ({ ...order, ads }))
+                //     )
+                // ),
+                // concatMap((order) => {
+                //     let { ads: ad_ids, email } = order;
+
+                //     let ads = Facebook.ads.details.get({ ad_ids, fb_ad_account_id, user_id, date }).pipe(
+                //         rxfilter((ad) => !isUndefined(ad.asset_id)),
+                //         rxmap((ad) => ({ ...ad, email })),
+                //         rxmap(of),
+                //         rxreduce((prev, curr) => [...prev, ...curr]),
+                //         defaultIfEmpty([])
+                //     );
+
+                //     return from(ads).pipe(rxmap((ads) => ({ ...order, ads, email })));
+                // }),
+                // rxmap(pick(["email", "cart", "ads", "stats"])),
+                // rxmap(of),
+                // rxreduce((prev, curr) => [...prev, ...curr]),
+                // rxmap(get(matching({ ads: (ads) => !isEmpty(ads) }))),
+                // rxmap(lokeyby("email")),
+                // rxmap((customers) => ({ customers })),
+                // rxmap((customers) => ({
+                //     ...customers,
+                //     date,
+                //     user_id,
+                // })),
+                // catchError((error) => rxof(error)),
+                // defaultIfEmpty({ date, customers: {}, user_id })
+            );
+
+            return customers_from_db_events.pipe(
+                concatMap(identity),
+                // rxmap(pipeLog),
+                concatMap((order) => {
+                    let { ads, email } = order;
+                    let ad_ids = pipe(mod(all)(pick(["ad_id"])))(ads);
+
+                    let ad_details = Facebook.ads.details.get({ ad_ids, fb_ad_account_id, user_id, date }).pipe(
                         rxfilter((ad) => !isUndefined(ad.asset_id)),
-                        rxmap((ad) => ({ ...ad, email })),
+                        rxmap((ad) => ({
+                            ...ad,
+                            email,
+                            // ipv4: pipe(get(matching({ ad_id: ad.ad_id }), "ipv4"), head)(ads),
+                            // ipv6: pipe(get(matching({ ad_id: ad.ad_id }), "ipv6"), head)(ads),
+                            // user_agent: pipe(get(matching({ ad_id: ad.ad_id }), "user_agent"), head)(ads),
+                            timestamp: pipe(get(matching({ ad_id: ad.ad_id }), "timestamp"), head)(ads),
+                        })),
                         rxmap(of),
                         rxreduce((prev, curr) => [...prev, ...curr]),
                         defaultIfEmpty([])
                     );
 
-                    return from(ads).pipe(rxmap((ads) => ({ ...order, ads, email })));
+                    return from(ad_details).pipe(
+                        rxmap((ads) => ({ ...order, ads, email })),
+                        defaultIfEmpty({ ...order, ads: [], email })
+                    );
                 }),
-                rxmap(pick(["email", "cart", "ads", "stats"])),
+                rxmap(pick(["email", "cart", "ads", "stats", "lower_case_email", "email"])),
                 rxmap(of),
                 rxreduce((prev, curr) => [...prev, ...curr]),
                 rxmap(get(matching({ ads: (ads) => !isEmpty(ads) }))),
-                rxmap(lokeyby("email")),
+                rxmap(pipe(logroupby("lower_case_email"), mod(all)(mergeAll))),
                 rxmap((customers) => ({ customers })),
                 rxmap((customers) => ({
                     ...customers,
                     date,
                     user_id,
                 })),
+                rxmap(pipeLog),
                 catchError((error) => rxof(error)),
                 defaultIfEmpty({ date, customers: {}, user_id })
             );
@@ -507,3 +603,43 @@ const Woocommerce = {
 };
 
 exports.Woocommerce = Woocommerce;
+
+// let user_id = "T8oAnETMOleR5QI6jvC09tlnkfo2";
+
+// let date = "2022-05-13";
+
+// from(getDocs(query(collectionGroup(db, "project_accounts"), where("roas_user_id", "==", user_id))))
+//     .pipe(
+//         rxmap(Woocommerce.utilities.queryDocs),
+//         rxmap(lofilter((project) => project.shopping_cart_name !== undefined)),
+//         rxmap(head),
+//         concatMap((project) => {
+//             return from(
+//                 getDocs(query(collectionGroup(db, "integrations"), where("account_name", "==", "facebook"), where("user_id", "==", user_id)))
+//             ).pipe(
+//                 rxmap(Woocommerce.utilities.queryDocs),
+//                 rxmap(head),
+//                 rxmap((facebook) => ({ ...facebook, ...project }))
+//             );
+//         })
+//     )
+//     .subscribe((project) => {
+//         console.log("project");
+//         console.log(project);
+
+//         let { roas_user_id: user_id, fb_ad_account_id, payment_processor_id, shopping_cart_id } = project;
+//         let payload = { user_id, fb_ad_account_id, payment_processor_id, shopping_cart_id, date };
+
+//         Woocommerce.report.get(payload).subscribe((result) => {
+//             console.log("result");
+//             // pipeLog(result);
+//         });
+//     });
+
+// from(getDocs(query(collection(db, "events"), where("roas_user_id", "==", user_id), where("locale_full_date", "==", "2022-05-12"), limit(100))))
+//     .pipe(rxmap(Woocommerce.utilities.queryDocs))
+//     .subscribe(pipeLog);
+
+// from(getDocs(query(collection(db, "woocommerce"), where("roas_user_id", "==", user_id), limit(1))))
+//     .pipe(rxmap(Woocommerce.utilities.queryDocs))
+//     .subscribe(pipeLog);
