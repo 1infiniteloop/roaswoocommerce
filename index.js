@@ -1,5 +1,24 @@
 const moment = require("moment-timezone");
-const { pick, map, pipe, values, head, identity, of, keys, curry, not, sum, flatten, paths, uniq, reject, mergeAll } = require("ramda");
+const {
+    pick,
+    map,
+    pipe,
+    values,
+    head,
+    identity,
+    of,
+    keys,
+    curry,
+    not,
+    sum,
+    flatten,
+    paths,
+    uniq,
+    reject,
+    mergeAll,
+    anyPass,
+    hasPath,
+} = require("ramda");
 const { size, isUndefined, isEmpty, toNumber, orderBy: lodashorderby, compact, toLower } = require("lodash");
 const { from, zip, Observable, of: rxof, iif, catchError, throwError } = require("rxjs");
 const { concatMap, map: rxmap, filter: rxfilter, tap, reduce: rxreduce, defaultIfEmpty } = require("rxjs/operators");
@@ -181,9 +200,13 @@ const Facebook = {
 
 const Event = {
     ad: {
-        id: ({ fb_ad_id, h_ad_id, ad_id } = {}) => {
+        id: ({ fb_ad_id, h_ad_id, ad_id, fb_id } = {}) => {
             let func_name = `Event:ad:id`;
             console.log(func_name);
+
+            if (fb_id) {
+                console.log("fb_id:", fb_id);
+            }
 
             if (ad_id) {
                 return ad_id;
@@ -210,30 +233,30 @@ const Event = {
     },
 
     get_utc_timestamp: (value) => {
-        console.log("get_utc_timestamp");
+        // console.log("get_utc_timestamp");
 
         let timestamp;
 
         if (get("created_at_unix_timestamp")(value)) {
             timestamp = get("created_at_unix_timestamp")(value);
-            console.log(timestamp);
+            // console.log(timestamp);
             return timestamp;
         }
 
         if (get("utc_unix_time")(value)) {
             let timestamp = get("utc_unix_time")(value);
-            console.log(timestamp);
+            // console.log(timestamp);
             return timestamp;
         }
 
         if (get("utc_iso_datetime")(value)) {
             let timestamp = pipe(get("utc_unix_time"), (value) => moment(value).unix())(value);
-            console.log(timestamp);
+            // console.log(timestamp);
             return timestamp;
         }
 
         timestamp = get("unix_datetime")(value);
-        console.log(timestamp);
+        // console.log(timestamp);
 
         if (!timestamp) {
             console.log("notimestamp");
@@ -250,14 +273,14 @@ const Events = {
             ipv4: ({ roas_user_id, ip }) => {
                 let func_name = "Events:user:get:ipv4";
                 console.log(func_name);
-                let events_query = query(collection(db, "user_events"), where("roas_user_id", "==", roas_user_id), where("ipv4", "==", ip));
+                let events_query = query(collection(db, "events"), where("roas_user_id", "==", roas_user_id), where("ipv4", "==", ip));
                 return from(getDocs(events_query)).pipe(rxmap((snapshot) => snapshot.docs.map((doc) => doc.data())));
             },
 
             ipv6: ({ roas_user_id, ip }) => {
                 let func_name = "Events:user:get:ipv6";
                 console.log(func_name);
-                let events_query = query(collection(db, "user_events"), where("roas_user_id", "==", roas_user_id), where("ipv6", "==", ip));
+                let events_query = query(collection(db, "events"), where("roas_user_id", "==", roas_user_id), where("ipv6", "==", ip));
                 return from(getDocs(events_query)).pipe(rxmap((snapshot) => snapshot.docs.map((doc) => doc.data())));
             },
         },
@@ -318,6 +341,8 @@ const Woocommerce = {
         queryDocs: (snapshot) => snapshot.docs.map((doc) => doc.data()),
 
         rxreducer: rxreduce((prev, curr) => [...prev, ...curr]),
+
+        has_ad_id: anyPass([hasPath(["fb_ad_id"]), hasPath(["h_ad_id"]), hasPath(["fb_id"]), hasPath(["ad_id"])]),
     },
 
     orders: {
@@ -487,8 +512,6 @@ const Woocommerce = {
                 rxmap(values)
             );
 
-            // return orders;
-
             let customers_from_db_events = from(orders).pipe(
                 concatMap(identity),
                 concatMap((customer) => {
@@ -498,13 +521,16 @@ const Woocommerce = {
 
                     return zip([from(ipEvents("ipv4", ip_address, roas_user_id)), from(ipEvents("ipv6", ip_address, roas_user_id))]).pipe(
                         rxmap(flatten),
+                        tap((value) => console.log("size ->", size(value))),
+                        rxmap(pipe(lofilter(Woocommerce.utilities.has_ad_id))),
+                        tap((value) => console.log("size <- ", size(value))),
                         concatMap(identity),
                         rxmap((event) => ({
                             ad_id: pipe(
                                 paths([["fb_ad_id"], ["h_ad_id"], ["fb_id"], ["ad_id"]]),
                                 compact,
                                 uniq,
-                                reject((id) => id == "%7B%7Bad.id%7D%7D"),
+                                reject((id) => id == "%7B%7Bad.id%7D%7D" || id == "{{ad.id}}"),
                                 head
                             )(event),
                             timestamp: pipe(Event.get_utc_timestamp)(event),
@@ -521,39 +547,6 @@ const Woocommerce = {
                     );
                 }),
                 Woocommerce.utilities.rxreducer
-                // rxmap(pipeLog)
-                // concatMap((order) =>
-                //     Woocommerce.order.ads.get(order).pipe(
-                //         rxfilter(pipe(isEmpty, not)),
-                //         rxmap((ads) => ({ ...order, ads }))
-                //     )
-                // ),
-                // concatMap((order) => {
-                //     let { ads: ad_ids, email } = order;
-
-                //     let ads = Facebook.ads.details.get({ ad_ids, fb_ad_account_id, user_id, date }).pipe(
-                //         rxfilter((ad) => !isUndefined(ad.asset_id)),
-                //         rxmap((ad) => ({ ...ad, email })),
-                //         rxmap(of),
-                //         rxreduce((prev, curr) => [...prev, ...curr]),
-                //         defaultIfEmpty([])
-                //     );
-
-                //     return from(ads).pipe(rxmap((ads) => ({ ...order, ads, email })));
-                // }),
-                // rxmap(pick(["email", "cart", "ads", "stats"])),
-                // rxmap(of),
-                // rxreduce((prev, curr) => [...prev, ...curr]),
-                // rxmap(get(matching({ ads: (ads) => !isEmpty(ads) }))),
-                // rxmap(lokeyby("email")),
-                // rxmap((customers) => ({ customers })),
-                // rxmap((customers) => ({
-                //     ...customers,
-                //     date,
-                //     user_id,
-                // })),
-                // catchError((error) => rxof(error)),
-                // defaultIfEmpty({ date, customers: {}, user_id })
             );
 
             return customers_from_db_events.pipe(
@@ -594,7 +587,7 @@ const Woocommerce = {
                     date,
                     user_id,
                 })),
-                rxmap(pipeLog),
+                // rxmap(pipeLog),
                 catchError((error) => rxof(error)),
                 defaultIfEmpty({ date, customers: {}, user_id })
             );
@@ -604,11 +597,11 @@ const Woocommerce = {
 
 exports.Woocommerce = Woocommerce;
 
-// let user_id = "T8oAnETMOleR5QI6jvC09tlnkfo2";
+// let user_id = "keLIx0XmvWf8NCnvdK0YL1wGq3f2";
 
-// let date = "2022-05-13";
+// let date = "2022-05-19";
 
-// from(getDocs(query(collectionGroup(db, "project_accounts"), where("roas_user_id", "==", user_id))))
+// from(getDocs(query(collection(db, "projects"), where("roas_user_id", "==", user_id))))
 //     .pipe(
 //         rxmap(Woocommerce.utilities.queryDocs),
 //         rxmap(lofilter((project) => project.shopping_cart_name !== undefined)),
